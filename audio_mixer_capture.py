@@ -9,7 +9,7 @@ Remuestrea en vivo a 16kHz mono y etiqueta el origen para una diarización perfe
 import threading
 import queue
 import time
-from typing import Optional, Callable, List, Dict, Tuple
+from typing import Optional, Callable, List, Dict, Tuple, Any
 import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy import signal
