@@ -6,5 +6,6 @@ __pycache__/
 venv/
 *.log
 reuniones/
+test_reuniones_sync/
 .idea/
 .vscode/
