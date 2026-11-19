@@ -1,0 +1,10 @@
+{
+    "theme": "dark_carbon",
+    "opacity": 94,
+    "font_size": 14,
+    "show_text_view": true,
+    "window_pos_x": 100,
+    "window_pos_y": 100,
+    "window_width": 640,
+    "expanded_height": 230
+}
