@@ -20,7 +20,7 @@ def generate_voice_tone(f0: float, duration_s: float = 1.0, sample_rate: int = 1
 
 def test_mic_diarization():
     print("=== TEST: DOS PERSONAS HABLANDO POR EL MISMO MICRÓFONO ===")
-    diarizer = MeetingSpeakerDiarizer(user_label="Tú")
+    diarizer = MeetingSpeakerDiarizer(user_label="Tú", multi_local_mode=True)
 
     # Persona A (Voz grave, F0 ~ 110 Hz)
     voice_a = generate_voice_tone(f0=110.0)

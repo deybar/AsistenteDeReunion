@@ -47,11 +47,11 @@ from meeting_window import MeetingWindow
 
 SOCKET_NAME = "AsistenteReunion_SingleInstance_2026"
 
-def ensure_single_instance(app, on_activate_cb) -> bool:
+def ensure_single_instance(app, on_activate_cb, on_quit_cb=None) -> bool:
     """Evita ejecuciones duplicadas del asistente en segundo plano."""
     test_socket = QLocalSocket()
     test_socket.connectToServer(SOCKET_NAME)
-    if test_socket.waitForConnected(400):
+    if test_socket.waitForConnected(800):
         logger.info("Ya existe una instancia del Asistente de Reunión activa. Activando ventana...")
         test_socket.write(b"ACTIVATE")
         test_socket.waitForBytesWritten(400)
@@ -64,9 +64,15 @@ def ensure_single_instance(app, on_activate_cb) -> bool:
         def handle_connection():
             client = server.nextPendingConnection()
             if client:
-                if client.waitForReadyRead(300):
+                if client.bytesAvailable() > 0 or client.waitForReadyRead(300):
                     data = client.readAll().data().decode("utf-8", errors="ignore")
-                    if "ACTIVATE" in data:
+                    if "QUIT" in data:
+                        logger.info("Recibida orden de cierre remoto (QUIT).")
+                        if on_quit_cb:
+                            on_quit_cb()
+                        else:
+                            app.quit()
+                    elif "ACTIVATE" in data:
                         on_activate_cb()
                 client.disconnectFromServer()
         server.newConnection.connect(handle_connection)
@@ -114,7 +120,7 @@ class MeetingAppController:
         self.transcript_manager = TranscriptManager(base_dir=self.config.get("save_dir", "reuniones"))
         self.meeting_agent = MeetingInsightsAgent(
             ollama_url=self.config.get("ollama_url", "http://localhost:11434"),
-            ollama_model=self.config.get("ollama_model", "qwen2.5:1.5b"),
+            ollama_model=self.config.get("ollama_model", "qwen2.5:3b"),
             ollama_enabled=self.config.get("ollama_enabled", True)
         )
 
@@ -130,7 +136,7 @@ class MeetingAppController:
         # 4. Transcriptor Whisper multilingüe con timestamps relativos
         self.transcriber = LiveMeetingTranscriber(
             audio_queue=self.audio_queue,
-            model_size=self.config.get("model_size", "tiny"),
+            model_size=self.config.get("model_size", "base"),
             language=self.config.get("language", "es"),
             sample_rate=16000,
             latency_mode=self.config.get("latency_mode", "ultra_fast"),
@@ -300,7 +306,13 @@ def main():
         if controller:
             controller._activate_window()
 
-    if not ensure_single_instance(app, activate_cb):
+    def quit_cb():
+        if controller:
+            controller.quit_application()
+        else:
+            app.quit()
+
+    if not ensure_single_instance(app, activate_cb, on_quit_cb=quit_cb):
         sys.exit(0)
 
     controller = MeetingAppController(app)

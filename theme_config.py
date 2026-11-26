@@ -109,13 +109,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "opacity": 92,
     "font_size": 15,
     "model_size": "base",              # "tiny", "base", "small" (multilingües)
+    "latency_mode": "ultra_fast",      # "ultra_fast", "balanced", "extended"
+    "language": "es",                  # "es", "auto", "en"
     "audio_mode": "mixed",             # "mixed" (PC + Mic), "loopback" (solo PC), "microphone" (solo Mic)
     "loopback_device_index": None,
     "mic_device_index": None,
     "user_label": "Tú",               # Etiqueta para el micrófono del usuario
     "auto_extract_summary": True,      # Activar agente al finalizar sesión
     "ollama_enabled": True,            # Si Ollama está disponible, usarlo opcionalmente
-    "ollama_model": "qwen2.5:1.5b",    # Modelo ligero para Ollama (o llama3.2:1b/3b)
+    "ollama_model": "qwen2.5:3b",      # Modelo ligero y preciso para Ollama
     "ollama_url": "http://localhost:11434",
     "save_dir": "reuniones",
     "window_pos_x": 100,

@@ -3,16 +3,18 @@ Capturador de Audio Multifuente en Tiempo Real (WASAPI Loopback + Micrófono Dua
 Permite capturar simultáneamente:
 1. Audio interno del PC (Teams, Zoom, Google Meet, navegadores) -> Colegas
 2. Micrófono físico local -> Tu propia voz
-Remuestrea en vivo a 16kHz mono y etiqueta el origen para una diarización perfecta.
+Remuestrea en vivo a 16kHz mono, mezcla de forma sincronizada al grabador WAV
+y etiqueta el origen para una diarización precisa.
 """
 
 import threading
 import queue
 import time
-from typing import Optional, Callable, List, Dict, Tuple, Any
+from typing import Optional, Callable, List, Dict, Any
 import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy import signal
+
 
 class AudioMixerCaptureManager:
     def __init__(
@@ -47,6 +49,10 @@ class AudioMixerCaptureManager:
         self.mic_channels = 1
 
         self._lock = threading.Lock()
+        self._mix_lock = threading.Lock()
+        self._pending_pc_chunks: List[np.ndarray] = []
+        self._pending_mic_chunks: List[np.ndarray] = []
+
         self._last_rms_pc = 0.0
         self._last_rms_mic = 0.0
 
@@ -59,7 +65,6 @@ class AudioMixerCaptureManager:
         p = pyaudio.PyAudio()
         devices = {"loopback": [], "microphone": []}
         try:
-            # Dispositivos de salida con soporte Loopback (WASAPI)
             for dev in p.get_loopback_device_info_generator():
                 devices["loopback"].append({
                     "index": dev["index"],
@@ -67,7 +72,6 @@ class AudioMixerCaptureManager:
                     "rate": int(dev["defaultSampleRate"]),
                     "channels": dev["maxInputChannels"]
                 })
-            # Micrófonos y entradas de grabación físicas
             for i in range(p.get_device_count()):
                 dev = p.get_device_info_by_index(i)
                 if dev["maxInputChannels"] > 0 and not dev.get("isLoopbackDevice", False):
@@ -86,7 +90,7 @@ class AudioMixerCaptureManager:
         try:
             wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
             default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-            
+
             for dev in p.get_loopback_device_info_generator():
                 if default_speakers["name"] in dev["name"]:
                     return dev
@@ -107,6 +111,10 @@ class AudioMixerCaptureManager:
         with self._lock:
             if self.is_running:
                 self.stop()
+
+            with self._mix_lock:
+                self._pending_pc_chunks.clear()
+                self._pending_mic_chunks.clear()
 
             self.current_mode = mode
             self.loopback_device_index = loopback_device_index
@@ -133,6 +141,8 @@ class AudioMixerCaptureManager:
         self.mic_stream = None
         self.silent_stream = None
 
+        self._flush_mixed_recorder(force_all=True)
+
         if self.p:
             try:
                 self.p.terminate()
@@ -158,60 +168,81 @@ class AudioMixerCaptureManager:
         down = native_rate // gcd
         return signal.resample_poly(audio_data, up, down).astype(np.float32)
 
+    def _flush_mixed_recorder(self, force_all: bool = False):
+        """Combina digitalmente los chunks de PC y micrófono antes de escribir al WAV (escala temporal 1:1)."""
+        if not self.recorder or self.is_paused:
+            return
+
+        with self._mix_lock:
+            while self._pending_pc_chunks and self._pending_mic_chunks:
+                pc_c = self._pending_pc_chunks.pop(0)
+                mic_c = self._pending_mic_chunks.pop(0)
+                min_len = min(len(pc_c), len(mic_c))
+                if min_len > 0:
+                    mixed = np.clip(pc_c[:min_len] + mic_c[:min_len], -1.0, 1.0)
+                    self.recorder.write_chunk(mixed)
+
+            while len(self._pending_pc_chunks) > 3 or (force_all and self._pending_pc_chunks):
+                pc_c = self._pending_pc_chunks.pop(0)
+                self.recorder.write_chunk(pc_c)
+
+            while len(self._pending_mic_chunks) > 3 or (force_all and self._pending_mic_chunks):
+                mic_c = self._pending_mic_chunks.pop(0)
+                self.recorder.write_chunk(mic_c)
+
+    def _process_stream_chunk(self, in_data: bytes, channels: int, native_rate: int, source_tag: str):
+        audio_data = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            audio_data = audio_data.reshape(-1, channels)
+            audio_data = np.mean(audio_data, axis=1)
+
+        rms = float(np.sqrt(np.mean(audio_data ** 2)))
+        if source_tag == "pc":
+            self._last_rms_pc = rms
+        else:
+            self._last_rms_mic = rms
+        self._emit_combined_level()
+
+        resampled = self._resample_audio(audio_data, native_rate)
+
+        if self.recorder and not self.is_paused:
+            if self.current_mode == "mixed":
+                with self._mix_lock:
+                    if source_tag == "pc":
+                        self._pending_pc_chunks.append(resampled)
+                    else:
+                        self._pending_mic_chunks.append(resampled)
+                self._flush_mixed_recorder()
+            else:
+                self.recorder.write_chunk(resampled)
+
+        try:
+            self.audio_queue.put_nowait((resampled, source_tag))
+        except queue.Full:
+            try:
+                self.audio_queue.get_nowait()
+                self.audio_queue.put_nowait((resampled, source_tag))
+            except queue.Empty:
+                pass
+
     def _loopback_callback(self, in_data, frame_count, time_info, status):
         """Callback invocado por el stream de sonido del PC (WASAPI Loopback)."""
         if not self.is_running or self.is_paused or not in_data:
             return (None, pyaudio.paContinue)
-
         try:
-            audio_data = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
-            if self.loopback_channels > 1:
-                audio_data = audio_data.reshape(-1, self.loopback_channels)
-                audio_data = np.mean(audio_data, axis=1)
-
-            rms = float(np.sqrt(np.mean(audio_data ** 2)))
-            self._last_rms_pc = rms
-            self._emit_combined_level()
-
-            resampled = self._resample_audio(audio_data, self.loopback_native_rate)
-
-            # Escribir en streaming continuo en el archivo WAV de la sesión
-            if self.recorder and not self.is_paused:
-                self.recorder.write_chunk(resampled)
-
-            # Encolar como fuente "pc"
-            self.audio_queue.put((resampled, "pc"))
+            self._process_stream_chunk(in_data, self.loopback_channels, self.loopback_native_rate, "pc")
         except Exception:
             pass
-
         return (None, pyaudio.paContinue)
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
         """Callback invocado por el micrófono físico."""
         if not self.is_running or self.is_paused or not in_data:
             return (None, pyaudio.paContinue)
-
         try:
-            audio_data = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
-            if self.mic_channels > 1:
-                audio_data = audio_data.reshape(-1, self.mic_channels)
-                audio_data = np.mean(audio_data, axis=1)
-
-            rms = float(np.sqrt(np.mean(audio_data ** 2)))
-            self._last_rms_mic = rms
-            self._emit_combined_level()
-
-            resampled = self._resample_audio(audio_data, self.mic_native_rate)
-
-            # Escribir en streaming continuo en el archivo WAV de la sesión
-            if self.recorder and not self.is_paused:
-                self.recorder.write_chunk(resampled)
-
-            # Encolar como fuente "mic"
-            self.audio_queue.put((resampled, "mic"))
+            self._process_stream_chunk(in_data, self.mic_channels, self.mic_native_rate, "mic")
         except Exception:
             pass
-
         return (None, pyaudio.paContinue)
 
     def _emit_combined_level(self):
@@ -225,7 +256,6 @@ class AudioMixerCaptureManager:
 
             # 1. Configurar Audio del PC (Loopback) si aplica
             if self.current_mode in ["mixed", "loopback"]:
-                target_lb = None
                 if self.loopback_device_index is not None:
                     target_lb = self.p.get_device_info_by_index(self.loopback_device_index)
                 else:
@@ -236,7 +266,6 @@ class AudioMixerCaptureManager:
                     self.loopback_channels = max(1, target_lb["maxInputChannels"])
                     frames_per_buf_lb = int(self.loopback_native_rate * 0.1)
 
-                    # Iniciar stream silencioso para mantener activo el reloj de audio
                     try:
                         wasapi_info = self.p.get_host_api_info_by_type(pyaudio.paWASAPI)
                         self.silent_stream = self.p.open(
@@ -299,7 +328,6 @@ class AudioMixerCaptureManager:
             }.get(self.current_mode, "Captura activa")
             self.update_status(status_text)
 
-            # Bucle de mantenimiento del reloj de audio WASAPI
             while self.is_running:
                 if self.silent_stream and not self.is_paused:
                     try:

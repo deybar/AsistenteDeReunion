@@ -175,6 +175,74 @@ def run_tests():
     print("  Recepción de intervención en la cápsula verificada.")
     print("=> TEST 3 superado exitosamente.")
 
+    # -------------------------------------------------------------
+    # TEST 4: Segmentación Dual sin Ping-Pong y Mezcla WAV 1:1
+    # -------------------------------------------------------------
+    print("\n[TEST 4] Verificación de Canales Aislados (Sin Ping-Pong) y Mezclador WAV:")
+    import queue
+    import time
+    import threading
+    from meeting_transcriber import LiveMeetingTranscriber
+    from audio_mixer_capture import AudioMixerCaptureManager
+
+    # 4A. Verificar segmentación aislada en LiveMeetingTranscriber
+    test_q = queue.Queue()
+    transcriber = LiveMeetingTranscriber(audio_queue=test_q, latency_mode="ultra_fast")
+    transcriber.is_running = True
+
+    t_seg = threading.Thread(target=transcriber._process_audio_loop, daemon=True)
+    t_seg.start()
+
+    chunk_samples_100ms = 1600
+    t_vec = np.linspace(0, 0.1, chunk_samples_100ms, endpoint=False)
+    voice_chunk = (np.sin(2 * np.pi * 220 * t_vec) * 0.15).astype(np.float32)  # RMS ~ 0.106
+    silent_chunk = np.zeros(chunk_samples_100ms, dtype=np.float32)
+
+    # 25 pares alternados mic(voz) / pc(silencio) = 2.5s simultáneos
+    for _ in range(25):
+        test_q.put((voice_chunk, "mic"))
+        test_q.put((silent_chunk, "pc"))
+
+    # 5 pares de silencio en ambos canales para disparar pausa
+    for _ in range(5):
+        test_q.put((silent_chunk, "mic"))
+        test_q.put((silent_chunk, "pc"))
+
+    time.sleep(0.35)
+    transcriber.is_running = False
+    t_seg.join(timeout=1.0)
+
+    q_items = []
+    while not transcriber._transcribe_queue.empty():
+        q_items.append(transcriber._transcribe_queue.get_nowait())
+
+    print(f"  Segmentos consolidados generados en modo mixto: {len(q_items)}")
+    assert len(q_items) == 1, f"Se esperaba 1 segmento consolidado, obtenidos {len(q_items)}"
+    seg_audio, seg_src, _, seg_start, seg_end = q_items[0]
+    print(f"  Canal: {seg_src} | Muestras: {len(seg_audio)} ({len(seg_audio)/16000:.2f}s) | Rango: {seg_start:.2f}s -> {seg_end:.2f}s")
+    assert seg_src == "mic", f"Canal esperado 'mic', obtenido {seg_src}"
+    assert len(seg_audio) >= 16000 * 2.0, f"Segmento fragmentado: solo {len(seg_audio)} muestras"
+
+    # 4B. Verificar duración WAV 1:1 en AudioMixerCaptureManager modo mixed
+    wav_mix_path = os.path.join(test_dir, "test_mixed_1to1.wav")
+    mix_rec = AudioMeetingRecorder(sample_rate=16000, channels=1)
+    assert mix_rec.start_recording(wav_mix_path)
+    mixer = AudioMixerCaptureManager(audio_queue=queue.Queue(), sample_rate=16000, recorder=mix_rec)
+    mixer.current_mode = "mixed"
+    mixer.is_paused = False
+
+    # Simular 20 bloques de 100ms de cada canal (2.0s reales)
+    for _ in range(20):
+        with mixer._mix_lock:
+            mixer._pending_pc_chunks.append(silent_chunk)
+            mixer._pending_mic_chunks.append(voice_chunk)
+        mixer._flush_mixed_recorder()
+
+    mix_meta = mix_rec.stop_recording()
+    print(f"  Duración WAV mixto grabado (2.0s reales): {mix_meta['duration_seconds']}s")
+    assert 1.9 <= mix_meta["duration_seconds"] <= 2.1, f"Deriva temporal WAV detectada: {mix_meta['duration_seconds']}s"
+    print("=> TEST 4 superado exitosamente.")
+
     print("\n" + "=" * 65)
     print("  RESULTADO: TODOS LOS TESTS PASARON CON ÉXITO (100% OPERATIVO)")
     print("=" * 65)

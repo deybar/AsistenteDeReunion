@@ -396,6 +396,19 @@ class MeetingWindow(QWidget):
         act_en = lang_menu.addAction("🇺🇸 Inglés")
         act_en.triggered.connect(lambda: self._set_language("en"))
 
+        # 5b. Modelo Whisper IA
+        model_menu = menu.addMenu("🧠 Modelo de Voz IA (Whisper)")
+        curr_model = self.config.get("model_size", "base")
+        model_options = [
+            ("base", "⚖️ Base (Equilibrado Rápido - Recomendado)"),
+            ("small", "🎯 Small (Alta Precisión - CPU Potente)"),
+            ("tiny", "⚡ Tiny (Ultra-Ligero)")
+        ]
+        for m_key, m_label in model_options:
+            prefix = "✓ " if m_key == curr_model else "   "
+            act_m = model_menu.addAction(f"{prefix}{m_label}")
+            act_m.triggered.connect(lambda checked, mk=m_key: self._set_model_size(mk))
+
         menu.addSeparator()
 
         # 6. Temas
@@ -427,6 +440,11 @@ class MeetingWindow(QWidget):
         self.config["language"] = lang_code
         save_config(self.config)
         self.language_changed.emit(lang_code)
+
+    def _set_model_size(self, model_key: str):
+        self.config["model_size"] = model_key
+        save_config(self.config)
+        self.model_changed.emit(model_key)
 
     def _set_theme(self, theme_key: str):
         self.config["theme"] = theme_key

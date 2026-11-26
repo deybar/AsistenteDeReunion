@@ -12,31 +12,106 @@ Arquitectura Híbrida:
 - Nivel 2: LLM Local Opcional (Ollama en localhost:11434 si está instalado)
 """
 
+import os
 import re
 import json
+import time
+import subprocess
 from typing import List, Dict, Any, Optional
 import requests
+
 
 class MeetingInsightsAgent:
     def __init__(
         self,
         ollama_url: str = "http://localhost:11434",
-        ollama_model: str = "qwen2.5:1.5b",
+        ollama_model: str = "qwen2.5:3b",
         ollama_enabled: bool = True
     ):
         self.ollama_url = ollama_url.rstrip("/")
         self.ollama_model = ollama_model
         self.ollama_enabled = ollama_enabled
+        self._ollama_start_attempted = False
+
+    def _try_start_ollama_service(self) -> bool:
+        """Intenta iniciar el servicio local de Ollama en segundo plano si está instalado."""
+        if self._ollama_start_attempted:
+            return False
+        self._ollama_start_attempted = True
+
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(local_app, "Programs", "Ollama", "ollama.exe") if local_app else "",
+            r"C:\Program Files\Ollama\ollama.exe"
+        ]
+        ollama_exe = next((p for p in candidates if p and os.path.exists(p)), None)
+        if not ollama_exe:
+            return False
+
+        try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                [ollama_exe, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+                close_fds=True
+            )
+            for _ in range(5):
+                time.sleep(0.5)
+                try:
+                    resp = requests.get(f"{self.ollama_url}/api/tags", timeout=0.8)
+                    if resp.status_code == 200:
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    def _select_available_model(self, models_payload: List[Dict[str, Any]]):
+        """Selecciona el modelo configurado o el mejor modelo chat/instruct instalado."""
+        names = [m.get("name", "") for m in models_payload if m.get("name")]
+        if not names:
+            return
+
+        if self.ollama_model in names:
+            return
+
+        base_target = self.ollama_model.split(":")[0].lower()
+        for name in names:
+            if name.lower().startswith(base_target):
+                self.ollama_model = name
+                return
+
+        preferred_prefixes = ("qwen2.5", "llama3.2", "llama3", "mistral", "gemma", "phi")
+        for pref in preferred_prefixes:
+            for name in names:
+                if pref in name.lower():
+                    self.ollama_model = name
+                    return
+
+        self.ollama_model = names[0]
 
     def is_ollama_available(self) -> bool:
-        """Verifica si el servicio local de Ollama está activo en el puerto 11434."""
+        """Verifica si Ollama está activo; si está instalado pero apagado, intenta levantarlo."""
         if not self.ollama_enabled:
             return False
         try:
             resp = requests.get(f"{self.ollama_url}/api/tags", timeout=1.2)
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                self._select_available_model(resp.json().get("models", []))
+                return True
         except Exception:
-            return False
+            if self._try_start_ollama_service():
+                try:
+                    resp = requests.get(f"{self.ollama_url}/api/tags", timeout=1.2)
+                    if resp.status_code == 200:
+                        self._select_available_model(resp.json().get("models", []))
+                        return True
+                except Exception:
+                    pass
+        return False
 
     def generate_meeting_report(self, entries: List[Dict[str, str]]) -> Dict[str, Any]:
         """
@@ -119,16 +194,20 @@ class MeetingInsightsAgent:
 
         total_words = 0
         speakers_participating = set()
+        substantive_turns = []
 
         for item in entries:
-            time_str = item.get("time", "")
+            time_str = item.get("time") or item.get("clock_time") or item.get("time_range") or ""
             speaker = item.get("speaker", "Interlocutor")
             text = item.get("text", "").strip()
             if not text:
                 continue
 
             speakers_participating.add(speaker)
-            total_words += len(text.split())
+            word_count = len(text.split())
+            total_words += word_count
+            if word_count >= 6:
+                substantive_turns.append((word_count, speaker, time_str, text))
 
             # 1. Detectar temas a estudiar / investigar / revisar
             for m in re_study.finditer(text):
@@ -183,12 +262,20 @@ class MeetingInsightsAgent:
                         "decision": dec.capitalize()
                     })
 
-        # Resumen general de la conversación
+        # Resumen general de la conversación con puntos destacados
         spk_list = ", ".join(sorted(speakers_participating)) if speakers_participating else "Participantes"
-        summary_intro = (
+        summary_lines = [
             f"Sesión con {len(speakers_participating)} interlocutor(es) activo(s) ({spk_list}) "
             f"con un total de {len(entries)} intervenciones registradas ({total_words} palabras)."
-        )
+        ]
+        if substantive_turns:
+            top_highlights = sorted(substantive_turns, key=lambda x: x[0], reverse=True)[:3]
+            summary_lines.append("Puntos destacados:")
+            for _, spk, t_str, txt in top_highlights:
+                snippet = txt if len(txt) <= 140 else txt[:137] + "..."
+                t_prefix = f"[{t_str}] " if t_str else ""
+                summary_lines.append(f"- {t_prefix}{spk}: {snippet}")
+        summary_intro = "\n".join(summary_lines)
 
         # Próximos pasos deducidos de los compromisos
         next_steps = []
@@ -210,42 +297,110 @@ class MeetingInsightsAgent:
     # =========================================================================
     # MOTOR LLM LOCAL CON OLLAMA (OPCIONAL EN LOCALHOST)
     # =========================================================================
+    @staticmethod
+    def _normalize_llm_report(parsed: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+        """Normaliza la estructura JSON devuelta por el LLM para evitar fallos en UI/Markdown."""
+        norm_commitments = []
+        for c in parsed.get("commitments", []) or []:
+            if isinstance(c, dict):
+                norm_commitments.append({
+                    "assignee": str(c.get("assignee") or c.get("responsable") or "Participante"),
+                    "task": str(c.get("task") or c.get("action") or c.get("description") or ""),
+                    "time": str(c.get("time") or "")
+                })
+            elif isinstance(c, str) and c.strip():
+                norm_commitments.append({"assignee": "Participante", "task": c.strip(), "time": ""})
+
+        norm_topics = []
+        for s in parsed.get("study_topics", []) or []:
+            if isinstance(s, dict):
+                norm_topics.append({
+                    "topic": str(s.get("topic") or s.get("tema") or ""),
+                    "speaker": str(s.get("speaker") or "")
+                })
+            elif isinstance(s, str) and s.strip():
+                norm_topics.append({"topic": s.strip(), "speaker": ""})
+
+        norm_decisions = []
+        for d in parsed.get("decisions", []) or []:
+            if isinstance(d, dict):
+                val = d.get("decision") or d.get("text") or ""
+                if str(val).strip():
+                    norm_decisions.append({"decision": str(val).strip(), "time": str(d.get("time") or "")})
+            elif isinstance(d, str) and d.strip():
+                norm_decisions.append({"decision": d.strip(), "time": ""})
+
+        norm_steps = []
+        for st in parsed.get("next_steps", []) or []:
+            if isinstance(st, dict):
+                norm_steps.append(str(st.get("step") or st.get("task") or st.get("description") or st))
+            elif isinstance(st, str) and st.strip():
+                norm_steps.append(st.strip())
+
+        return {
+            "summary": str(parsed.get("summary") or "Resumen generado por IA local."),
+            "commitments": [c for c in norm_commitments if c["task"]],
+            "study_topics": [t for t in norm_topics if t["topic"]],
+            "decisions": norm_decisions,
+            "next_steps": norm_steps,
+            "source": f"ollama ({model_name})"
+        }
+
     def _generate_with_ollama(self, entries: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
-        # Construir transcripción en texto plano
         lines = []
         for e in entries:
-            lines.append(f"[{e.get('time', '')}] {e.get('speaker', '')}: {e.get('text', '')}")
+            t_val = e.get("time") or e.get("clock_time") or e.get("time_range") or ""
+            lines.append(f"[{t_val}] {e.get('speaker', '')}: {e.get('text', '')}")
         transcript_text = "\n".join(lines)
+        if len(transcript_text) > 4500:
+            transcript_text = transcript_text[-4500:]
 
         prompt = (
-            "Eres un Asistente Senior de Desarrollo de Software y Minutas de Reunión. "
-            "A continuación tienes la transcripción fiel de una reunión de trabajo técnica.\n\n"
+            "Eres un Asistente Ejecutivo Senior de Ingeniería y Análisis de Reuniones. "
+            "A continuación tienes la transcripción automática (ASR) de una reunión o sesión técnica.\n"
+            "Deduce el significado real usando el contexto completo incluso si hay pequeños errores fonéticos.\n\n"
             f"--- TRANSCRIPCIÓN ---\n{transcript_text}\n--- FIN TRANSCRIPCIÓN ---\n\n"
-            "Analiza detalladamente el texto y genera un JSON estrictamente estructurado con las siguientes claves:\n"
+            "Genera un JSON estrictamente válido en español con estas claves:\n"
             "{\n"
-            '  "summary": "Resumen conciso de los temas tratados y el objetivo de la reunión",\n'
-            '  "commitments": [{"assignee": "Quién asumió el compromiso", "task": "Acción o entregable comprometido"}],\n'
-            '  "study_topics": [{"topic": "Tema técnico, librería o arquitectura que se debe estudiar o revisar"}],\n'
+            '  "summary": "Resumen ejecutivo claro (3 a 5 líneas) explicando objetivo, temas y conclusiones",\n'
+            '  "commitments": [{"assignee": "Responsable", "task": "Acción concreta", "time": "HH:MM:SS"}],\n'
+            '  "study_topics": [{"topic": "Tema técnico o concepto clave para investigar/revisar", "speaker": "Quién lo mencionó"}],\n'
             '  "decisions": ["Acuerdos técnicos o decisiones tomadas"],\n'
-            '  "next_steps": ["Próximos pasos a seguir por el equipo"]\n'
+            '  "next_steps": ["Lista de próximos pasos prácticos"]\n'
             "}\n"
-            "IMPORTANTE: Responde ÚNICAMENTE con el bloque JSON, sin introducciones ni saludos."
+            "IMPORTANTE: Responde ÚNICAMENTE con el objeto JSON válido."
         )
 
         payload = {
             "model": self.ollama_model,
             "prompt": prompt,
-            "stream": False,
-            "format": "json"
+            "stream": True,
+            "format": "json",
+            "keep_alive": "10m",
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": 2048,
+                "num_predict": 650
+            }
         }
 
-        resp = requests.post(f"{self.ollama_url}/api/generate", json=payload, timeout=20)
+        resp = requests.post(f"{self.ollama_url}/api/generate", json=payload, stream=True, timeout=(5, 90))
         if resp.status_code == 200:
-            data = resp.json()
-            response_text = data.get("response", "{}")
+            chunks = []
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                    if obj.get("response"):
+                        chunks.append(obj["response"])
+                    if obj.get("done"):
+                        break
+                except Exception:
+                    continue
+            response_text = "".join(chunks).strip() or "{}"
             parsed = json.loads(response_text)
-            parsed["source"] = f"ollama ({self.ollama_model})"
-            return parsed
+            return self._normalize_llm_report(parsed, self.ollama_model)
         return None
 
     # =========================================================================

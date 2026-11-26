@@ -73,6 +73,35 @@ flowchart LR
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/) y versionado semántico.
 
+### [1.2.0] - 2026-11-20
+#### Diagnóstico de Sesiones Reales Nocturnas (00:34–01:35 a.m.)
+Del análisis de `asistente_reunion.log`, `reunion_20261120_013023.md`/`.wav` (vídeo técnico YouTube sobre Espressif ESP-Mosaico/ESP32/ESP8266) y `reunion_20261120_003428.wav` (micrófono bajo volumen) en `Intel Core i7-6500U`:
+1. **Bloqueo de cola con modelo `small`:** Tardaba `12.9s–13.3s` por cada bloque de `5.3s` (`RTF = 2.45x`), acumulando retraso y perdiendo fluidez en tiempo real. Al cambiar a `tiny` (`RTF = 0.34x`), la precisión fonética en español resultó insuficiente.
+2. **Saturación de Silero VAD por pre-amplificación (`10x`):** Amplificar bloques de 100ms hasta `10x` antes del VAD elevaba música/respiración sobre el umbral `0.35`, forzando cortes rígidos por `max_speech`.
+3. **Palabras divididas en frontera de bloque (`"dispuesto | positivo"`):** Cortar exactamente al alcanzar `max_speech` truncaba sílabas intermedias.
+4. **Doble filtrado VAD y eco de prompt:** Ejecutar `vad_filter=True` dentro de Whisper consumía ~35% extra de CPU; además, un `initial_prompt` redactado como lista suelta de acrónimos provocaba eco al inicio con música.
+5. **Alternancia falsa en diarización (`Participante 1` ↔ `Participante 2`):** Picos aislados de F0 hacían caer la similitud coseno por debajo de `0.40`, rompiendo la histeresis para un solo locutor continuo.
+6. **Bug temporal en modo `mixed` y errores LLM/Agente:** Resuelta la deriva temporal 2x en WAV mixto (`_flush_mixed_recorder`), aislamiento de buffers `mic`/`pc`, `ReadTimeoutError` de Ollama migrando a `stream=True` + `num_ctx=2048` + `qwen2.5:3b` y normalización de `decisions` en `_normalize_llm_report()`.
+
+#### Tabla Comparativa de Experimentos y Cambios Aplicados
+| Experimento / Decisión | Resultado Observado | Estado Final |
+|---|---|---|
+| `small` + `vad_filter=True` (CPU `i7-6500U`) | `12.9s` por cada `5.3s` (`RTF = 2.45x`), saturaba cola | **Descartado por defecto** (conservado como opción en menú) |
+| `tiny` (`39M`) | Rápido (`RTF = 0.34x`), errores fonéticos altos en ES | **Descartado por defecto** |
+| **`base` (`74M`) + `cpu_threads=4` + `beam=2` + `vad_filter=False`** | **`RTF = 0.42x–0.52x`** (casi 2x más rápido que tiempo real) | **Adoptado por defecto (`config.json`, `main.py`, `theme_config.py`)** |
+| Corte rígido en `max_speech` vs **Multi-Scale Valley Splitting (`130ms + 240ms`)** | El corte rígido partía palabras; Valley Splitting corta en el valle inter-palabra conservando `carry_over` | **Adoptado (`_find_best_valley_cut`)** |
+| Ganancia VAD `10x` (umbral `0.35`) vs **Ganancia VAD `<= 3.5x` (umbral `0.42`)** | Evita falsos positivos por música de fondo sin perder voz baja en micrófono | **Adoptado (`_get_neural_speech_prob`)** |
+| `initial_prompt` lista de siglas vs **Oración natural + `_refine_technical_text()`** | Elimina eco inicial de acrónimos y normaliza `Espressif`, `ESP-Mosaico`, `microcontroladores` | **Adoptado (`meeting_transcriber.py`)** |
+| Diarización remota con salto directo `< 0.40` vs **Histeresis estricta (`streak >= 2`, `pause >= 0.65s`, `sim < 0.58`)** | 15/15 segmentos estables en `Participante 1` para un narrador continuo (conservando multi-locutor en mic) | **Adoptado (`speaker_diarizer.py`)** |
+| Ollama síncrono `num_ctx=4096` vs **Streaming JSON (`qwen2.5:3b`, `num_ctx=2048`)** | Elimina timeouts al generar minuta ejecutiva local | **Adoptado (`meeting_agent.py`)** |
+
+#### Añadido en Calidad y Pruebas (`test_real_audio_functional.py`)
+- **Suite funcional con audios reales (`test_real_audio_functional.py`):**
+  1. Validación sobre `reunion_20261120_013023.wav` (YouTube real, 65s): procesado en `33.62s` (`RTF = 0.52x`), `15/15` segmentos asignados a `Participante 1`, `4/5` términos clave técnicos verificados y exportación `.md`/`.json`/`.txt`.
+  2. Validación sobre `reunion_20261120_003428.wav` (micrófono bajo volumen, 60s): `RTF = 0.12x`, recuperación limpia por `AGC` bajo etiqueta `Tú`.
+  3. Prueba en vivo extremo a extremo reproduciendo síntesis `SAPI5` por altavoces con captura real **WASAPI Loopback** (`AudioMixerCaptureManager`).
+- Método `flush_and_stop()` en `LiveMeetingTranscriber` para drenado determinista al cerrar sesión sin perder la frase final.
+
 ### [1.1.0] - 2026-11-19
 #### Añadido
 - **Modo HUD Zen Minimalista:** Ventana compacta estilo cápsula flotante (52 px de altura) con esquinas redondeadas y translucidez.
